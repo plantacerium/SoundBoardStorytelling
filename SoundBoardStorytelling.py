@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtCore import Qt, QUrl, QSize, QMimeData, QPoint, QBuffer, QPropertyAnimation, QEasingCurve, QTimer
+from PySide6.QtCore import Qt, QUrl, QSize, QMimeData, QPoint, QBuffer, QPropertyAnimation, QEasingCurve, QTimer, QByteArray
 from PySide6.QtGui import QDrag, QAction, QPixmap, QPainter, QImage, QColor, QTextCursor, QFont, QPalette, QBrush, QLinearGradient, QIcon, QRadialGradient
 
 # --- Configuration ---
@@ -95,7 +95,7 @@ QSlider::sub-page:horizontal {{
 
 /* Scroll Area - Invisible */
 QScrollArea {{ background: transparent; border: none; }}
-QWidget#GridContainer {{ background: transparent; }}
+/* QWidget#GridContainer handled in class */
 
 /* Text Ambienter - The Parchment of the Future */
 QTextEdit {{
@@ -169,6 +169,7 @@ SOUND_CUE_HTML_FORMAT = (
 
 class SoundButtonWidget(QWidget):
     """A luxury button-like widget for the sound grid."""
+    
     def __init__(self, full_path, relative_path, display_name, parent=None):
         super().__init__(parent)
         self.full_path = full_path
@@ -178,7 +179,7 @@ class SoundButtonWidget(QWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.setCursor(Qt.OpenHandCursor)
-        self.setToolTip(f"Drag to insert ->\n{os.path.basename(full_path)}")
+        self.setToolTip(f"Drag to reorder or insert ->\n{os.path.basename(full_path)}")
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -231,22 +232,17 @@ class SoundButtonWidget(QWidget):
             # Active: Glowing Border, Cyan Tint
             border = f"1px solid {ACCENT_CYAN}"
             bg = "rgba(0, 242, 255, 0.1)"
-            
-            # Pulse the shadow
             s_color = QColor(ACCENT_CYAN)
             s_color.setAlpha(100)
             self.shadow.setColor(s_color)
             self.shadow.setBlurRadius(40)
-            
             self.status_bar.setStyleSheet(f"background-color: {ACCENT_CYAN}; box-shadow: 0 0 10px {ACCENT_CYAN};")
         else:
             # Idle: Glassy
             border = "1px solid rgba(255, 255, 255, 0.1)" 
-            bg = "rgba(40, 40, 60, 0.4)" # Slightly lighter than BG
-            
+            bg = "rgba(40, 40, 60, 0.4)" 
             self.shadow.setColor(QColor(0, 0, 0, 100))
             self.shadow.setBlurRadius(20)
-            
             self.status_bar.setStyleSheet("background-color: rgba(255,255,255,0.1);")
 
         self.container.setStyleSheet(f"""
@@ -284,8 +280,6 @@ class SoundButtonWidget(QWidget):
     def _on_playback_changed(self, state):
         is_playing = (state == QMediaPlayer.PlayingState)
         self.update_style(active=is_playing)
-        
-        # Notify Parent App to update icons in Text Widget
         mw = self.window()
         if isinstance(mw, SoundBoardApp):
              mw.update_text_icon_state(self.relative_path, is_playing)
@@ -312,10 +306,8 @@ class SoundButtonWidget(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.drag_start_position = event.position().toPoint()
-            # FIX: Do not toggle playback here to prevent activation on drag start
 
     def mouseReleaseEvent(self, event):
-        # FIX: Activate on release if no drag occurred
         if event.button() == Qt.LeftButton:
              self.toggle_playback()
 
@@ -323,25 +315,25 @@ class SoundButtonWidget(QWidget):
         if not (event.buttons() & Qt.LeftButton): return
         if (event.position().toPoint() - self.drag_start_position).manhattanLength() < QApplication.startDragDistance(): return
 
-        # Optional: Stop playing if drag starts? 
-        # self.player.stop() 
-
         drag = QDrag(self)
         mime_data = QMimeData()
         
-        # Default is play icon; safe get
         icon_b64 = ICON_PLAY
         if not icon_b64:
              icon_b64 = get_base64_icon("play", ACCENT_CYAN)
 
+        # 1. HTML Data for Text Editor
         cue_html = SOUND_CUE_HTML_FORMAT.format(
             base64_icon=icon_b64,
             path=self.relative_path, 
             name=self.display_name
         )
-        
         mime_data.setHtml(cue_html)
-        drag.setMimeData(mime_data) # CRITICAL FIX: Set mime data before exec
+        
+        # 2. Reorder Data for Grid (Custom Type)
+        mime_data.setData("application/x-sound-path", QByteArray(self.relative_path.encode('utf-8')))
+        
+        drag.setMimeData(mime_data)
         
         pixmap = self.container.grab()
         drag.setPixmap(pixmap.scaled(QSize(100, 60), Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -350,7 +342,61 @@ class SoundButtonWidget(QWidget):
         drag.exec(Qt.MoveAction)
 
 
-# --- 2. The Text Ambienter Widget ---
+# --- 2. Sound Grid Container (Drag Target) ---
+
+class SoundGridContainer(QWidget):
+    """Container that accepts drops for reordering."""
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self.setAcceptDrops(True)
+        self.setObjectName("GridContainer")
+        # Layout will be assigned externally
+        
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-sound-path"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+            
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat("application/x-sound-path"):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasFormat("application/x-sound-path"):
+            path_bytes = event.mimeData().data("application/x-sound-path")
+            src_path = bytes(path_bytes).decode('utf-8')
+            
+            target_index = -1
+            layout = self.layout()
+            if layout:
+                pos = event.position().toPoint()
+                closest_dist = 999999
+                
+                # Iterate through widgets to find insertion point
+                for i in range(layout.count()):
+                    widget = layout.itemAt(i).widget()
+                    if widget:
+                        geo = widget.geometry()
+                        # If inside the widget, take that index
+                        if geo.contains(pos):
+                            target_index = i
+                            break
+                        
+                        # Else find closest
+                        center = geo.center()
+                        dist = (pos - center).manhattanLength()
+                        if dist < closest_dist:
+                            closest_dist = dist
+                            target_index = i
+            
+            if target_index >= 0:
+                self.app.reorder_sounds(src_path, target_index)
+                event.acceptProposedAction()
+
+
+# --- 3. The Text Ambienter Widget ---
 
 class TextAmbienterWidget(QTextEdit):
     """Text editor that accepts sound cue drops and handles playback."""
@@ -385,22 +431,14 @@ class TextAmbienterWidget(QTextEdit):
         super().mousePressEvent(event)
 
     def set_icon_state(self, rel_path, is_playing):
-        """
-        Visually toggles the icon for a given path between Play and Stop.
-        """
         html = self.toHtml()
-        
-        # Regex to find the img inside the anchor for this specific path
         search_pattern = re.compile(
             f'(<a href="cue:{re.escape(rel_path)}"[^>]*>.*?<img src="data:image/png;base64,)([^"]*)(".*?</a>)', 
             re.DOTALL
         )
-        
         target_icon = ICON_STOP if is_playing else ICON_PLAY
         if not target_icon: return 
-        
         new_html = search_pattern.sub(f'\\1{target_icon}\\3', html)
-        
         if new_html != html:
             cursor = self.textCursor()
             vscroll = self.verticalScrollBar().value()
@@ -409,7 +447,7 @@ class TextAmbienterWidget(QTextEdit):
             self.verticalScrollBar().setValue(vscroll)
 
 
-# --- 3. Main Application ---
+# --- 4. Main Application ---
 
 class SoundBoardApp(QMainWindow):
     def __init__(self):
@@ -417,6 +455,8 @@ class SoundBoardApp(QMainWindow):
         self.setWindowTitle("🎧 Universe Storyteller")
         self.resize(1100, 850)
         self.available_widgets = {} 
+        self.sound_order = [] # List of relative paths in order
+        
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
@@ -428,18 +468,14 @@ class SoundBoardApp(QMainWindow):
         self._load_config()
 
     def _init_ui(self):
-        # 1. Background Gradient (Fake, via Widget)
-        # We use styleSheet on Main, but let's make a container for padding
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
         content_layout.setContentsMargins(30, 30, 30, 30)
         content_layout.setSpacing(20)
         self.main_layout.addWidget(content_widget)
 
-        # 2. Header
+        # Header
         header_layout = QHBoxLayout()
-        
-        # Logo / Title
         title_box = QVBoxLayout()
         title_lbl = QLabel("UNIVERSE STORYTELLER")
         title_lbl.setStyleSheet(f"font-size: 24px; font-weight: 800; letter-spacing: 4px; color: {ACCENT_CYAN};")
@@ -454,18 +490,15 @@ class SoundBoardApp(QMainWindow):
         # Controls
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(15)
-        
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(100)
         self.volume_slider.setFixedWidth(150)
         self.volume_slider.valueChanged.connect(self._set_global_volume)
-        
         self.stop_all_btn = QPushButton("STOP ALL")
         self.stop_all_btn.setObjectName("STOP_BTN")
         self.stop_all_btn.setCursor(Qt.PointingHandCursor)
         self.stop_all_btn.clicked.connect(self._stop_all_sounds)
-        
         self.save_btn = QPushButton("SAVE")
         self.save_btn.setObjectName("SAVE_BTN")
         self.save_btn.setCursor(Qt.PointingHandCursor)
@@ -475,29 +508,25 @@ class SoundBoardApp(QMainWindow):
         controls_layout.addWidget(self.volume_slider)
         controls_layout.addWidget(self.stop_all_btn)
         controls_layout.addWidget(self.save_btn)
-        
         header_layout.addLayout(controls_layout)
         content_layout.addLayout(header_layout)
 
-        # Divider (Cyber Line)
         divider = QFrame()
         divider.setFixedHeight(1)
         divider.setStyleSheet(f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 transparent, stop:0.5 {ACCENT_CYAN}, stop:1 transparent); opacity: 0.5;")
         content_layout.addWidget(divider)
 
-        # 3. Sound Grid
-        grid_container_widget = QWidget()
-        grid_container_widget.setObjectName("GridContainer")
-        self.sound_grid_layout = QGridLayout(grid_container_widget)
+        # 3. Sound Grid Container
+        self.grid_container_widget = SoundGridContainer(self) 
+        self.sound_grid_layout = QGridLayout(self.grid_container_widget)
         self.sound_grid_layout.setContentsMargins(10, 10, 10, 10)
         self.sound_grid_layout.setSpacing(20)
         
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(grid_container_widget)
+        scroll_area.setWidget(self.grid_container_widget)
         scroll_area.setMaximumHeight(350)
         scroll_area.setMinimumHeight(200)
-        
         content_layout.addWidget(scroll_area)
         
         # 4. Text Area
@@ -528,39 +557,83 @@ class SoundBoardApp(QMainWindow):
         return sound_files
 
     def _load_config(self):
-        available_sounds = self._scan_sounds_directory()
-        available_rel_paths = {rel: full for full, rel in available_sounds}
-        loaded_rels = set()
-        
+        scanned_sounds = self._scan_sounds_directory()
+        scanned_map = {rel: full for full, rel in scanned_sounds}
+        self.sound_order = [] 
+
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
             self.volume_slider.setValue(config.get('volume', 100))
             self.text_ambienter.setHtml(config.get('text_html', ''))
             
+            # Load stored order
             for item in config.get('sounds', []):
                 rel_path = item['path']
-                if rel_path in available_rel_paths:
-                    full_path = available_rel_paths[rel_path]
-                    self._add_sound_button(full_path, rel_path, item['display_name'])
-                    loaded_rels.add(rel_path)
+                if rel_path in scanned_map:
+                    self.sound_order.append(rel_path)
+                    
+                    # Create widget if not exists
+                    if rel_path not in self.available_widgets:
+                        self._create_sound_widget(scanned_map[rel_path], rel_path, item['display_name'])
+                    else:
+                        # Just update name if needed
+                        self.available_widgets[rel_path].display_name = item['display_name']
+                        self.available_widgets[rel_path].name_label.setText(item['display_name'])
+
         except (FileNotFoundError, json.JSONDecodeError):
             pass
             
-        for full, rel in available_sounds:
-            if rel not in loaded_rels:
-                display_name = os.path.splitext(os.path.basename(rel))[0]
-                self._add_sound_button(full, rel, display_name)
+        # Add new sounds
+        for full, rel in scanned_sounds:
+            if rel not in self.sound_order:
+                self.sound_order.append(rel)
+                if rel not in self.available_widgets:
+                     # Use filename as default display name
+                     display_name = os.path.splitext(os.path.basename(rel))[0]
+                     self._create_sound_widget(full, rel, display_name)
+        
+        self.refresh_grid_layout()
 
-    def _add_sound_button(self, full_path, rel_path, display_name):
+    def _create_sound_widget(self, full_path, rel_path, display_name):
         widget = SoundButtonWidget(full_path, rel_path, display_name)
         widget.set_volume(self.volume_slider.value())
-        
-        count = self.sound_grid_layout.count()
-        row = count // COLUMNS
-        col = count % COLUMNS
-        self.sound_grid_layout.addWidget(widget, row, col)
         self.available_widgets[rel_path] = widget
+
+    def refresh_grid_layout(self):
+        # Clear layout (remove from layout but don't delete widget)
+        for i in reversed(range(self.sound_grid_layout.count())):
+            item = self.sound_grid_layout.itemAt(i)
+            if item.widget():
+                item.widget().setParent(None) # Detach from layout
+                
+        # Re-add in order
+        for index, rel_path in enumerate(self.sound_order):
+            widget = self.available_widgets.get(rel_path)
+            if widget:
+                # IMPORTANT: Widget must be reparented to the container
+                widget.setParent(self.grid_container_widget)
+                widget.show() # Ensure visible
+                
+                row = index // COLUMNS
+                col = index % COLUMNS
+                self.sound_grid_layout.addWidget(widget, row, col)
+
+    def reorder_sounds(self, src_path, target_index):
+        if src_path not in self.sound_order: return
+        
+        # Calculate current logical index
+        old_index = self.sound_order.index(src_path)
+        if old_index == target_index: return
+        
+        # Move item
+        item = self.sound_order.pop(old_index)
+        
+        # Adjust target index if shifting
+        # Note: drop index is spatial, insert index is logical.
+        self.sound_order.insert(target_index, item)
+        
+        self.refresh_grid_layout()
 
     def _save_config(self):
         data = {
@@ -568,8 +641,12 @@ class SoundBoardApp(QMainWindow):
             "text_html": self.text_ambienter.toHtml(), 
             "sounds": []
         }
-        for rel_path, widget in self.available_widgets.items():
-            data["sounds"].append(widget.get_config_data())
+        
+        # Save based on ORDER list
+        for rel_path in self.sound_order:
+            widget = self.available_widgets.get(rel_path)
+            if widget:
+                data["sounds"].append(widget.get_config_data())
             
         with open(CONFIG_FILE, 'w') as f:
             json.dump(data, f, indent=4)
@@ -585,13 +662,11 @@ class SoundBoardApp(QMainWindow):
             widget.stop()
 
     def play_sound(self, rel_path):
-        """Called by Text Widget Click"""
         widget = self.available_widgets.get(rel_path)
         if widget:
             widget.toggle_playback()
             
     def update_text_icon_state(self, rel_path, is_playing):
-        """Called by Button Widget when state changes"""
         self.text_ambienter.set_icon_state(rel_path, is_playing)
 
     def closeEvent(self, event):
@@ -600,15 +675,10 @@ class SoundBoardApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
-    # Initialize global icons after App creation
     init_global_icons() 
-    
-    # Optional: Font tuning if possible, otherwise defaults
     font = app.font()
     font.setPointSize(10)
     app.setFont(font)
-    
     window = SoundBoardApp()
     window.show()
     sys.exit(app.exec())
